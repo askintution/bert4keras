@@ -555,6 +555,7 @@ def extend_with_piecewise_linear_lr(BaseOptimizer):
 @export_to_custom_objects
 def extend_with_piecewise_linear_lr_v2(BaseOptimizer):
     """返回新的优化器类，加入分段线性学习率
+    RoBERTa用的就是这个？？
     """
     class NewOptimizer(BaseOptimizer):
         """带有分段线性学习率的优化器

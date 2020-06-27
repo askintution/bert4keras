@@ -50,6 +50,13 @@ class Transformer(object):
         self.name = name
         self.built = False
 
+    """
+    创建模型
+    1. 获取inputs.子类重写该方法.每个子类模型的inputs不太一样,比如Bert有position embeddings,GPT没有position embeddings
+    2. 设置Conditional Layer Normalization
+    3. 调用model
+    4. outputs
+    """
     def build(
         self,
         layer_norm_cond=None,
@@ -67,7 +74,13 @@ class Transformer(object):
         # Input
         inputs = self.get_inputs()
         self.set_inputs(inputs, additional_input_layers)
-        # Other
+        
+        """
+        layer_norm_cond: 是个shape参数
+        layer_norm_cond_hidden_size:如果该参数为None，则意味着它是一个整数，用于先将输入条件投影到更低维空间，这是因为输入的条件可能维度很高，直接投影到hidden_size（比如768）的话，
+        参数可能过多，所以可以先投影到更低维空间，然后升维；
+        layer_norm_cond_hidden_act 投影到更低维空间时的激活函数，如果为None，则不加激活函数（线性激活）；默认为linear
+        """
         self.layer_norm_conds = [
             layer_norm_cond,
             layer_norm_cond_hidden_size,
@@ -80,6 +93,9 @@ class Transformer(object):
         self.model = Model(self.inputs, self.outputs, name=self.name)
         self.built = True
 
+    """
+    真正模型执行的地方: 分为 embeddings main-layers final-layers
+    """
     def call(self, inputs):
         """定义模型的执行流程
         """
@@ -92,6 +108,14 @@ class Transformer(object):
         outputs = self.apply_final_layers(outputs)
         return outputs
 
+    """
+    给相应的Layer设置key,value.key就是设置的layer name，value就是该层对应的function。
+    arguments: 调用层的call函数时，可以额外使用的参数，比如embedding层可以使用mode这个参数。mode可以设置为embedding和dense层。
+    kwargs: 创建layer的参数
+
+    如果该层name已经存在在layer当中，那么就提取已经存在的层，
+    如果该层仍然未创建，先创建该层
+    """
     def apply(self, inputs, layer=None, arguments=None, **kwargs):
         """通过apply调用层会自动重用同名层
         inputs: 上一层的输出；
@@ -196,6 +220,10 @@ class Transformer(object):
         """
         return {}
 
+    """
+    1. 获取模型变量mapping： key为 'Embedding-Token': ['bert/embeddings/word_embeddings']
+    2. 将每层的权重复制到对应的key上面去batch_set_value
+    """
     def load_weights_from_checkpoint(self, checkpoint, mapping=None):
         """根据mapping从checkpoint加载权重
         """
@@ -271,6 +299,7 @@ class BERT(Transformer):
         self.with_nsp = with_nsp
         self.with_mlm = with_mlm
         self.custom_position_ids = custom_position_ids
+        # 默认，下一句预测是使用pool方法的
         if self.with_nsp and not self.with_pool:
             self.with_pool = True
 
@@ -287,6 +316,10 @@ class BERT(Transformer):
         else:
             return [x_in, s_in]
 
+    """
+    1. 计算token,segment,position embeddings,将三种embedding相加
+    2. 过layernorm,dropout,dense层统一维度
+    """
     def apply_embeddings(self, inputs):
         """BERT的embedding是token、position、segment三者embedding之和
         """
@@ -297,6 +330,17 @@ class BERT(Transformer):
         else:
             p = None
 
+
+        """
+        设置keras layer embeddings:
+        input_dim: int > 0。词汇表大小， 即，最大整数 index + 1。
+        output_dim: int >= 0。词向量的维度。
+        embeddings_initializer: embeddings 矩阵的初始化方法 (详见 initializers)。
+        embeddings_regularizer: embeddings matrix 的正则化方法 (详见 regularizer)。
+        embeddings_constraint: embeddings matrix 的约束函数 (详见 constraints)。
+        mask_zero: 是否把 0 看作为一个应该被遮蔽的特殊的 "padding" 值。 这对于可变长的 循环神经网络层 十分有用。 如果设定为 True，那么接下来的所有层都必须支持 masking，否则就会抛出异常。 如果 mask_zero 为 True，作为结果，索引 0 就不能被用于词汇表中 （input_dim 应该与 vocabulary + 1 大小相同）。
+        input_length: 输入序列的长度，当它是固定的时。 如果你需要连接 Flatten 和 Dense 层，则这个参数是必须的 （没有它，dense 层的输出尺寸就无法计算）。
+        """
         x = self.apply(
             inputs=x,
             layer=Embedding,
@@ -315,6 +359,7 @@ class BERT(Transformer):
             name='Embedding-Segment'
         )
         x = self.apply(inputs=[x, s], layer=Add, name='Embedding-Token-Segment')
+
         x = self.apply(
             inputs=self.simplify([x, p]),
             layer=PositionEmbedding,
@@ -325,6 +370,10 @@ class BERT(Transformer):
             custom_position_ids=self.custom_position_ids,
             name='Embedding-Position'
         )
+
+        """
+        如果是条件生成的，传入z，z是个层，比如<tf.Tensor 'reshape_3/Reshape:0' shape=(?, 128) dtype=float32>
+        """
         x = self.apply(
             inputs=self.simplify([x, z]),
             layer=LayerNormalization,
@@ -351,6 +400,10 @@ class BERT(Transformer):
 
         return x
 
+    """
+    1. MultiHeadAttention + dropout + residual block + LayerNormalization
+    2. FeedForward + dropout + residual block + LayerNormalization
+    """
     def apply_main_layers(self, inputs, index):
         """BERT的主体是基于Self-Attention的模块
         顺序：Att --> Add --> LN --> FFN --> Add --> LN
@@ -428,6 +481,10 @@ class BERT(Transformer):
 
         return x
 
+    """
+    1. pooler.  取第一维度x[:,0], dense+tanh,dense+softmax
+    2. MLM. dense+activation, LayerNormalization, embeddings, BiasAdd, softmax
+    """
     def apply_final_layers(self, inputs):
         """根据剩余参数决定输出
         """
@@ -760,6 +817,10 @@ class NEZHA(BERT):
     """华为推出的NAZHA模型
     链接：https://arxiv.org/abs/1909.00204
     """
+
+    """
+    Token Embedding + Segment Embedding, LayerNormalization,Dropout
+    """
     def apply_embeddings(self, inputs):
         """NEZHA的embedding是token、segment两者embedding之和
         """
@@ -819,7 +880,10 @@ class NEZHA(BERT):
 
         attention_name = 'Transformer-%d-MultiHeadSelfAttention' % index
         feed_forward_name = 'Transformer-%d-FeedForward' % index
+
+        # 这里默认attention mask是None的情况
         attention_mask = self.compute_attention_mask(index)
+        # 使用经典的sin,cos相对位置编码
         position_bias = self.compute_position_bias(x)
 
         # Self Attention
@@ -973,6 +1037,9 @@ class GPT2_ML(Transformer):
         x_in = Input(shape=(self.sequence_length,), name='Input-Token')
         return x_in
 
+    """
+    Token Embedding + PositionEmbedding + LayerNormalization
+    """
     def apply_embeddings(self, inputs):
         """GPT2_ML的embedding是token、position两者embedding之和
         """
@@ -1018,6 +1085,11 @@ class GPT2_ML(Transformer):
 
         return x
 
+    """
+    跟Bert的不一样。
+    MultiHeadAttention, Dropout, Residual block
+    LayerNormalization, FeedForward, Dropout, Residual block
+    """
     def apply_main_layers(self, inputs, index):
         """GPT2_ML的主体是基于Self-Attention的模块
         顺序：Att  --> LN --> FFN --> Add --> LN
@@ -1434,6 +1506,10 @@ class T5_Encoder(T5_Base):
 
         return x
 
+    """
+    使用位置嵌入的简化形式——每个“嵌入”只是一个标量，被添加到用于计算注意力权重的相应 logit 中。
+    为了提高效率还在模型的所有层之间共享位置嵌入参数，不过每个注意力头使用的是不同“套”位置嵌入。
+    """
     def compute_position_bias(self, inputs=None):
         """T5相对位置编码
         """
@@ -1768,6 +1844,7 @@ def extend_with_language_model(BaseModel):
     """
     class LanguageModel(BaseModel):
         """带下三角Attention Mask的派生模型
+        使用语言模型的时候，默认with_mlm为True
         """
         def __init__(self, *args, **kwargs):
             super(LanguageModel, self).__init__(*args, **kwargs)

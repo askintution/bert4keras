@@ -55,12 +55,14 @@ token_dict, keep_tokens = load_vocab(
 tokenizer = Tokenizer(token_dict, do_lower_case=True)
 
 
+"""
+单条样本格式：[CLS]篇章[SEP]问题[SEP]答案[SEP]
+segment_ids.是只有答案的地方是1，其它地方为0
+"""
 class data_generator(DataGenerator):
     """数据生成器
     """
     def __iter__(self, random=False):
-        """单条样本格式：[CLS]篇章[SEP]问题[SEP]答案[SEP]
-        """
         batch_token_ids, batch_segment_ids = [], []
         for is_end, D in self.sample(random):
             question = D['question']
@@ -84,6 +86,10 @@ class data_generator(DataGenerator):
             segment_ids = p_segment_ids + qa_segment_ids[1:]
             batch_token_ids.append(token_ids)
             batch_segment_ids.append(segment_ids)
+
+            """
+            在一个batch之内，将tokens排列到相同字数。比如128个字符，117个字符等。
+            """
             if len(batch_token_ids) == self.batch_size or is_end:
                 batch_token_ids = sequence_padding(batch_token_ids)
                 batch_segment_ids = sequence_padding(batch_segment_ids)
@@ -128,6 +134,22 @@ class ReadingComprehension(AutoRegressiveDecoder):
         super(ReadingComprehension, self).__init__(**kwargs)
         self.mode = mode
 
+    """
+    如果ngram是1的话:
+    get_ngram_set(np.array([8894, 11429,  4536,  1056,  1891,   680,  1248,  7313,  1628]),1)
+    {(): {680, 1056, 1248, 1628, 1891, 4536, 7313, 8894, 11429}}
+
+    如果ngram是2的话
+    get_ngram_set(np.array([8894, 11429,  4536,  1056,  1891,   680,  1248,  7313,  1628]),2)
+    {(8894,): {11429},
+     (11429,): {4536},
+     (4536,): {1056},
+     (1056,): {1891},
+     (1891,): {680},
+     (680,): {1248},
+     (1248,): {7313},
+     (7313,): {1628}}
+    """
     def get_ngram_set(self, x, n):
         """生成ngram合集，返回结果格式是:
         {(n-1)-gram: set([n-gram的第n个字集合])}
@@ -154,6 +176,8 @@ class ReadingComprehension(AutoRegressiveDecoder):
             all_segment_ids.extend(segment_ids)
         padded_all_token_ids = sequence_padding(all_token_ids)
         padded_all_segment_ids = sequence_padding(all_segment_ids)
+
+        # probas shape (3, 100, 13584) 13584是token的length长度
         probas = model.predict([padded_all_token_ids, padded_all_segment_ids])
         probas = [
             probas[i, len(ids) - 1] for i, ids in enumerate(all_token_ids)
@@ -175,15 +199,23 @@ class ReadingComprehension(AutoRegressiveDecoder):
                 inputs = [i for i in inputs if i[0, 0] > -1]  # 过滤掉无答案篇章
         if self.mode == 'extractive':
             # 如果是抽取式，那么答案必须是篇章的一个片段
-            # 那么将非篇章片段的概率值全部置0
+            # 那么将非篇章片段的概率值全部置0,然后在需要设置概率的地方设置概率值
             new_probas = np.zeros_like(probas)
             ngrams = {}
             for token_ids in inputs:
                 token_ids = token_ids[0]
                 sep_idx = np.where(token_ids == tokenizer._token_end_id)[0][0]
                 p_token_ids = token_ids[1:sep_idx]
+
+                """
+                这里是设置ngram，比如一句话:我爱我家，那么我后面会跟"爱"或者"家",那么这个时候就会设置key: ("我"的token_id) , value是{ "爱"的token_id,"家"的token_id }
+                """
                 for k, v in self.get_ngram_set(p_token_ids, states + 1).items():
                     ngrams[k] = ngrams.get(k, set()) | v
+
+            """
+            根据之前已经输出的token_id,比如我，这里就开始计算"爱"和"家"的概率值
+            """        
             for i, ids in enumerate(output_ids):
                 available_idxs = ngrams.get(tuple(ids), set())
                 available_idxs.add(tokenizer._token_end_id)
@@ -199,6 +231,10 @@ class ReadingComprehension(AutoRegressiveDecoder):
             p_token_ids = tokenizer.encode(passage, maxlen=max_p_len)[0]
             q_token_ids = tokenizer.encode(question, maxlen=max_q_len + 1)[0]
             token_ids.append(p_token_ids + q_token_ids[1:])
+
+        """
+        从passage和query的词汇中beam search
+        """
         output_ids = self.beam_search(
             token_ids, topk, states=0
         )  # 基于beam search

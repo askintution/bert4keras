@@ -25,9 +25,9 @@ num_classes = 2
 epochs = 20
 
 # bert配置
-config_path = '/root/kg/bert/chinese_L-12_H-768_A-12/bert_config.json'
-checkpoint_path = '/root/kg/bert/chinese_L-12_H-768_A-12/bert_model.ckpt'
-dict_path = '/root/kg/bert/chinese_L-12_H-768_A-12/vocab.txt'
+dict_path = '/data/welab/datasets/NLP/chinese_L-12_H-768_A-12/vocab.txt'
+config_path = '/data/welab/datasets/NLP/chinese_L-12_H-768_A-12/bert_config.json'
+checkpoint_path = '/data/welab/datasets/NLP/chinese_L-12_H-768_A-12/bert_model.ckpt'
 
 # 加载并精简词表，建立分词器
 token_dict, keep_tokens = load_vocab(
@@ -36,7 +36,6 @@ token_dict, keep_tokens = load_vocab(
     startswith=['[PAD]', '[UNK]', '[CLS]', '[SEP]'],
 )
 tokenizer = Tokenizer(token_dict, do_lower_case=True)
-
 
 def load_data(filenames):
     """加载数据，并尽量划分为不超过maxlen的句子
@@ -54,12 +53,26 @@ def load_data(filenames):
 
 # 加载数据集
 data = load_data([
-    'datasets/sentiment/sentiment.train.data',
-    'datasets/sentiment/sentiment.valid.data',
-    'datasets/sentiment/sentiment.test.data',
+    './sentiment/sentiment.train.data',
+    './sentiment/sentiment.valid.data',
+    './sentiment/sentiment.test.data',
 ])
 
 
+"""
+返回的结果:
+([array([[   2, 6462, 6462, 1860, 4161, 2295, 1010, 3578, 1819, 1037, 7203,
+          6861, 6104, 3717, 3972, 6718, 1497, 3512, 1498, 5783, 4179,  577,
+          1497, 3512, 6600, 1663, 3073, 1497, 3512, 1675, 1033, 1992,  575,
+          6718, 1497, 3512, 1367, 2667, 1675, 1660,  569, 6527,   70,    3]]),
+  array([[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]),
+  array([[1]])],
+ None)
+
+
+
+"""
 class data_generator(DataGenerator):
     """数据生成器
     """
@@ -74,6 +87,9 @@ class data_generator(DataGenerator):
                 batch_token_ids = sequence_padding(batch_token_ids)
                 batch_segment_ids = sequence_padding(batch_segment_ids)
                 batch_labels = sequence_padding(batch_labels)
+                """
+                为什么这里传回None？？
+                """
                 yield [batch_token_ids, batch_segment_ids, batch_labels], None
                 batch_token_ids, batch_segment_ids, batch_labels = [], [], []
 
@@ -87,13 +103,25 @@ class CrossEntropy(Loss):
             y_mask = 1.0
         else:
             y_mask = K.cast(mask[1], K.floatx())[:, 1:]
-        y_true = y_true[:, 1:]  # 目标token_ids
+        y_true = y_true[:, 1:]  # 目标token_ids,因为第0位是CLS，所以从第一位开始
         y_pred = y_pred[:, :-1]  # 预测序列，错开一位
         loss = K.sparse_categorical_crossentropy(y_true, y_pred)
         loss = K.sum(loss * y_mask) / K.sum(y_mask)
         return loss
 
 
+"""
+Model 结构:
+_________________________________________________________________
+Layer (type)                 Output Shape              Param #   
+=================================================================
+input_1 (InputLayer)         (None, 1)                 0         
+_________________________________________________________________
+embedding_1 (Embedding)      (None, 1, 128)            256       
+_________________________________________________________________
+reshape_1 (Reshape)          (None, 128)               0         
+=================================================================
+"""
 c_in = Input(shape=(1,))
 c = Embedding(2, 128)(c_in)
 c = Reshape((128,))(c)
@@ -108,6 +136,8 @@ model = build_transformer_model(
     additional_input_layers=c_in,
 )
 
+# 这里执行Loss层的call函数，实际上相当于inputs = [model.inputs[0], model.outputs[0]],返回的序号为1，即实际返回的是model.outputs[0]。
+# 因为训练的是语言模型，所以相当于计算输入字段和输出字段的softmax函数。
 output = CrossEntropy(1)([model.inputs[0], model.outputs[0]])
 
 model = Model(model.inputs, output)

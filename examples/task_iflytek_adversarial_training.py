@@ -92,6 +92,16 @@ model.compile(
 )
 
 
+"""
+对于CV任务来说，一般输入张量的shape是(b,h,w,c)，这时候我们需要固定模型的batch size（即b），然后给原始输入加上一个shape同样为(b,h,w,c)、全零初始化的Variable，比如就叫做Δx，那么我们可以直接求loss对x的梯度，然后根据梯度给Δx赋值，来实现对输入的干扰，完成干扰之后再执行常规的梯度下降。
+
+对于NLP任务来说，原则上也要对Embedding层的输出进行同样的操作，Embedding层的输出shape为(b,n,d)，所以也要在Embedding层的输出加上一个shape为(b,n,d)的Variable，然后进行上述步骤。但这样一来，我们需要拆解、重构模型，对使用者不够友好。
+
+不过，我们可以退而求其次。Embedding层的输出是直接取自于Embedding参数矩阵的，因此我们可以直接对Embedding参数矩阵进行扰动。这样得到的对抗样本的多样性会少一些（因为不同样本的同一个token共用了相同的扰动），但仍然能起到正则化的作用，而且这样实现起来容易得多。
+
+1. 根据loss，计算embedding的梯度,delta就是梯度，梯度上升，说明loss增大。
+2. 加入扰动之后，我们预期loss增大，此时在使用一次梯度下降算法，使得模型能够抵抗这种扰动。
+"""
 def adversarial_training(model, embedding_name, epsilon=1):
     """给模型添加对抗训练
     其中model是需要添加对抗训练的keras模型，embedding_name
@@ -112,6 +122,9 @@ def adversarial_training(model, embedding_name, epsilon=1):
     # 求Embedding梯度
     embeddings = embedding_layer.embeddings  # Embedding矩阵
     gradients = K.gradients(model.total_loss, [embeddings])  # Embedding梯度
+    """
+    embedding的梯度不是一个普通的tensor，而是一个IndexedSlices，需要用这种方式转换成普通的tensor，才能参与运算。
+    """
     gradients = K.zeros_like(embeddings) + gradients[0]  # 转为dense tensor
 
     # 封装为函数
@@ -135,7 +148,7 @@ def adversarial_training(model, embedding_name, epsilon=1):
     model.train_function = train_function  # 覆盖原训练函数
 
 
-# 写好函数后，启用对抗训练只需要一行代码
+# 写好函数后，启用对抗训练只需要一行代码。由于每一步算对抗扰动也需要计算梯度，因此每一步训练一共算了两次梯度，因此每步的训练时间会翻倍。
 adversarial_training(model, 'Embedding-Token', 0.5)
 
 

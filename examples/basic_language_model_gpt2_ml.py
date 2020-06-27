@@ -22,7 +22,10 @@ model = build_transformer_model(
 
 
 class ArticleCompletion(AutoRegressiveDecoder):
+    
     """基于随机采样的文章续写
+    将input tokens和已经生成的tokens合并
+    根据最新的tokens预测下一个词语
     """
     @AutoRegressiveDecoder.set_rtype('probas')
     def predict(self, inputs, output_ids, step):

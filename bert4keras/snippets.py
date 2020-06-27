@@ -386,6 +386,7 @@ class AutoRegressiveDecoder(object):
         """
         raise NotImplementedError
 
+    
     def beam_search(self, inputs, topk, states=None, min_ends=1):
         """beam search解码
         说明：这里的topk即beam size；
@@ -424,6 +425,17 @@ class AutoRegressiveDecoder(object):
         # 达到长度直接输出
         return output_ids[output_scores.argmax()]
 
+
+    """
+    为解决搜索生成太乏味，可以通过采样来增加随机性，也就是上面所要的意外性。但增加随机性同时，会出现另一个问题，那就是生成可能会出现语法错误。
+    举个栗子，假如说对全体词按照预测概率来采样，就可能出现采样到低概率词，从而在语法上导致整句话出现问题。
+    那么怎样避免该情况发生呢？可以通过强化顶部词的概率，然后只对最有可能的一些词进行采样，这样就能够在增加随机性的同时，又保证不出现一般性的错误。
+
+    强化化顶部词概率，可以通过对模型输出的 logits 除以一个小于 1 的温度（Temperature，T）。
+    这样就能在过 softmax 后使得分布更加尖锐，大概率的词概率更大。
+    之后根据获得概率对顶部词先进行挑选，然后再采样，这样直接杜绝了低概率词出现的可能性。
+    而这里挑选的策略，目前最主流的便是，TopK 和 TopP.
+    """
     def random_sample(
         self, inputs, n, topk=None, topp=None, states=None, min_ends=1
     ):
@@ -444,11 +456,22 @@ class AutoRegressiveDecoder(object):
                 probas = np.repeat(probas, n, axis=0)
                 inputs = [np.repeat(i, n, axis=0) for i in inputs]
                 output_ids = np.repeat(output_ids, n, axis=0)
+
+            """
+            关于 TopK 采样，就是挑选概率最高 k 个 token，然后重新过 softmax 算概率，之后根据获得概率进行采样，接着进行下一步生成，不断重复。
+            """
             if topk is not None:
                 k_indices = probas.argpartition(-topk,
                                                 axis=1)[:, -topk:]  # 仅保留topk
                 probas = np.take_along_axis(probas, k_indices, axis=1)  # topk概率
                 probas /= probas.sum(axis=1, keepdims=True)  # 重新归一化
+
+            """
+            但关于 TopK 有可能会出现一个问题，那便是，假如说遇上一种情况，模型对当前生成非常肯定，比如说概率最高的 token 的概率就有 0.9，而剩下的 token 概率都很低了。而如果这个时候，还单纯的用 topk 采样的话，就会导致之前想避免的采样到低概率情况仍然发生。
+            因此我们需要对顶部 token 的累计概率进行限制，这就是 TopP 采样。
+
+            和 TopK 单纯限制取顶部 k 个不同，TopP 是先设置一个概率界限，比如说 p=0.9，然后从最大概率的 token 往下开始取，同时将概率累加起来，当取到大于等于 p 也就是 0.9 时停止。
+            """
             if topp is not None:
                 p_indices = probas.argsort(axis=1)[:, ::-1]  # 从高到低排序
                 probas = np.take_along_axis(probas, p_indices, axis=1)  # 排序概率
@@ -457,9 +480,15 @@ class AutoRegressiveDecoder(object):
                 flag[:, 0] = False  # 结合上面的np.roll，实现平移一位的效果
                 probas[flag] = 0  # 后面的全部置零
                 probas /= probas.sum(axis=1, keepdims=True)  # 重新归一化
+
             sample_func = lambda p: np.random.choice(len(p), p=p)  # 按概率采样函数
             sample_ids = np.apply_along_axis(sample_func, 1, probas)  # 执行采样
             sample_ids = sample_ids.reshape((-1, 1))  # 对齐形状
+
+            """
+            先进行topp采样
+            再进行topk采样
+            """
             if topp is not None:
                 sample_ids = np.take_along_axis(
                     p_indices, sample_ids, axis=1
@@ -468,8 +497,14 @@ class AutoRegressiveDecoder(object):
                 sample_ids = np.take_along_axis(
                     k_indices, sample_ids, axis=1
                 )  # 对齐原id
+
             output_ids = np.concatenate([output_ids, sample_ids], 1)  # 更新输出
             end_counts = (output_ids == self.end_id).sum(1)  # 统计出现的end标记
+
+            """
+            如果有已经完成的（判断标准就是end标记，这里是句话），那么把已经写好的句子放入output_ids中。
+            如果还有没完成的，把output_ids转换成当前未完成的句子
+            """
             if output_ids.shape[1] >= self.minlen:  # 最短长度判断
                 flag = (end_counts == min_ends)  # 标记已完成序列
                 if flag.any():  # 如果有已完成的
@@ -503,6 +538,7 @@ def insert_arguments(**arguments):
         return new_func
 
     return actual_decorator
+
 
 
 def delete_arguments(*arguments):

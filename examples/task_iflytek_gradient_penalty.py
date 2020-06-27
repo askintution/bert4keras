@@ -95,7 +95,10 @@ def sparse_categorical_crossentropy(y_true, y_pred):
     y_true = K.one_hot(y_true, K.shape(y_pred)[-1])
     return K.categorical_crossentropy(y_true, y_pred)
 
-
+"""
+加入扰动，也是为了影响梯度
+改变loss，也可以改变影响梯度。就相当于个等式运算，是在左边减去，还是在右边加上，意义一样
+"""
 def loss_with_gradient_penalty(y_true, y_pred, epsilon=1):
     """带梯度惩罚的loss
     """

@@ -99,6 +99,7 @@ class Embedding(keras.layers.Embedding):
         if mode == 'embedding':
             return super(Embedding, self).call(inputs)
         else:
+            # 转置函数
             kernel = K.transpose(self.embeddings)
             return K.dot(inputs, kernel)
 
@@ -128,7 +129,8 @@ class BiasAdd(Layer):
 
 
 class MultiHeadAttention(Layer):
-    """多头注意力机制
+    """
+    多头注意力机制
     """
     def __init__(
         self,
@@ -183,6 +185,18 @@ class MultiHeadAttention(Layer):
                 不同的attention mask对应不同的应用。
         p_bias: 在attention里的位置偏置。
                 一般用来指定相对位置编码的种类。
+
+
+        1. 计算q,k的attention
+        2. 位置编码
+        3. 缩放点积 attention
+        4. 对value 进行mask
+        5. 对attention矩阵的mask
+        6. softmax attention
+        7. 将attention与value进行相乘
+        8. 位置编码
+        9. output dense
+        10. 对output进行query的mask处理
         """
         q, k, v = inputs[:3]
         q_mask, v_mask, n = None, None, 3
@@ -220,8 +234,11 @@ class MultiHeadAttention(Layer):
         a = K.softmax(a)
         # 完成输出
         o = tf.einsum('bhjk,bkhd->bjhd', a, vw)
+
+        # 如果是相对位置编码，还要加上attention 矩阵乘法 pos_embeddings
         if p_bias == 'typical_relative':
             o = o + tf.einsum('bhjk,jkd->bjhd', a, pos_embeddings)
+            
         o = K.reshape(o, (-1, K.shape(o)[1], self.out_dim))
         o = self.o_dense(o)
         # 返回结果
@@ -321,7 +338,9 @@ class LayerNormalization(Layer):
 
     @recompute_grad
     def call(self, inputs):
-        """如果是条件Layer Norm，则默认以list为输入，第二个是condition
+        """
+        如果是条件Layer Norm，则默认以list为输入，第二个是condition
+        条件Layer Norm的时候，beta，gamma的之后由传入的cond有关。
         """
         if self.conditional:
             inputs, cond = inputs
@@ -339,6 +358,9 @@ class LayerNormalization(Layer):
             if self.scale:
                 gamma = self.gamma
 
+        """
+        LayerNormalization的计算公式，先计算mean值以及方差，然后再乘以gamma，加上beta。
+        """
         outputs = inputs
         if self.center:
             mean = K.mean(outputs, axis=-1, keepdims=True)
@@ -395,12 +417,19 @@ class PositionEmbedding(Layer):
 
     def build(self, input_shape):
         super(PositionEmbedding, self).build(input_shape)
+
+        """
+        每层的参数通过这个函数来设定
+        """
         self.embeddings = self.add_weight(
             name='embeddings',
             shape=(self.input_dim, self.output_dim),
             initializer=self.embeddings_initializer
         )
 
+    """
+    call是最重要的函数，它用于实现层的功能，子类必须实现。
+    """
     def call(self, inputs):
         """如果custom_position_ids，那么第二个输入为自定义的位置id
         """
@@ -414,6 +443,16 @@ class PositionEmbedding(Layer):
             batch_size, seq_len = input_shape[0], input_shape[1]
             pos_embeddings = self.embeddings[:seq_len]
             pos_embeddings = K.expand_dims(pos_embeddings, 0)
+
+            """
+            embeddings不是直接相加，需要expand维度。
+            keras.backend.tile(x, n)： 创建一个用 n 平铺 的 x 张量。
+
+            example:
+            K.tile(inputs,[1,1,1,512]) 
+            #inputs是四维张量，[batchsize,width,height, channels]
+            #把channel第四维复制512倍  经常搭配Kexpand_dims(x, axis=-1)
+            """
             if self.merge_mode != 'add':
                 pos_embeddings = K.tile(pos_embeddings, [batch_size, 1, 1])
 
@@ -422,6 +461,9 @@ class PositionEmbedding(Layer):
         else:
             return K.concatenate([inputs, pos_embeddings])
 
+    """
+    根据input_shape 计算输出的shape，子类必须实现。用于自动推断下一层的输入尺寸。
+    """
     def compute_output_shape(self, input_shape):
         if self.custom_position_ids:
             input_shape = input_shape[0]
@@ -431,6 +473,10 @@ class PositionEmbedding(Layer):
         else:
             return input_shape[:2] + (input_shape[2] + self.output_dim,)
 
+    """
+    get_config 返回一个字典，获取当前层的参数信息。
+    from_config 使用根据参数生成一个新的层。
+    """
     def get_config(self):
         config = {
             'input_dim': self.input_dim,
@@ -468,6 +514,9 @@ class RelativePositionEmbedding(Layer):
         pos_ids = self.compute_position_ids(inputs)
         return K.gather(self.embeddings, pos_ids)
 
+    """
+    计算query和value的相对位置，并把超过一定长度的置为0或者max_position
+    """
     def compute_position_ids(self, inputs):
         q, v = inputs
         # 计算位置差
@@ -519,6 +568,8 @@ class RelativePositionEmbeddingT5(RelativePositionEmbedding):
 
     def compute_position_ids(self, inputs):
         """T5的相对位置分桶（直接翻译自官方T5源码）
+        对所有模型使用 32 个嵌入，其数值范围的大小以对数方式增加，最大偏移量为128，超过此偏移量，所有相对位置使用同一嵌入。
+        需要注意的是，某一给定层对超过 128 的相对位置不敏感，但是后续层可以通过组合来自先前层的局部信息来建立对更大偏移的敏感性。
         """
         q, v = inputs
         # 计算位置差
