@@ -27,8 +27,8 @@ class ArticleCompletion(AutoRegressiveDecoder):
     将input tokens和已经生成的tokens合并
     根据最新的tokens预测下一个词语
     """
-    @AutoRegressiveDecoder.set_rtype('probas')
-    def predict(self, inputs, output_ids, step):
+    @AutoRegressiveDecoder.wraps(default_rtype='probas')
+    def predict(self, inputs, output_ids, states):
         token_ids = np.concatenate([inputs[0], output_ids], 1)
         return model.predict(token_ids)[:, -1]
 
