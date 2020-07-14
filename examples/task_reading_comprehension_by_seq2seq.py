@@ -162,6 +162,14 @@ class ReadingComprehension(AutoRegressiveDecoder):
             result[k[:-1]].add(k[-1])
         return result
 
+    """
+    先排除没有答案的篇章，然后在解码答案的每一个字时，直接将所有篇章预测的概率值（按照某种方式）取平均。
+
+    所有篇章分别和问题拼接起来，然后给出各自的第一个字的概率分布。那些第一个字就给出[SEP]的篇章意味着它是没有答案的，排除掉它们。
+    排除掉之后，将剩下的篇章的第一个字的概率分布取平均，然后再保留topk（beam search的标准流程）。
+    预测第二个字时，每个篇章与topk个候选值分别组合，预测各自的第二个字的概率分布，然后再按照篇章将概率平均后，再给出topk。
+    依此类推，直到出现[SEP]。（在普通的beam search基础上加上按篇章平均）
+    """    
     @AutoRegressiveDecoder.wraps(default_rtype='probas', use_states=True)
     def predict(self, inputs, output_ids, states):
         inputs = [i for i in inputs if i[0, 0] > -1]  # 过滤掉无答案篇章
@@ -170,14 +178,16 @@ class ReadingComprehension(AutoRegressiveDecoder):
         for token_ids in inputs:  # inputs里每个元素都代表一个篇章
             token_ids = np.concatenate([token_ids, output_ids], 1)
             segment_ids = np.zeros_like(token_ids)
+            # 将output_id的segment置为1
             if states > 0:
                 segment_ids[:, -output_ids.shape[1]:] = 1
             all_token_ids.extend(token_ids)
             all_segment_ids.extend(segment_ids)
+
         padded_all_token_ids = sequence_padding(all_token_ids)
         padded_all_segment_ids = sequence_padding(all_segment_ids)
 
-        # probas shape (3, 100, 13584) 13584是token的length长度
+        # probas shape (3, 100, 13584) 13584是所有token的length长度
         probas = model.predict([padded_all_token_ids, padded_all_segment_ids])
         probas = [
             probas[i, len(ids) - 1] for i, ids in enumerate(all_token_ids)
@@ -197,6 +207,7 @@ class ReadingComprehension(AutoRegressiveDecoder):
                     inputs[i][:, 0] = -1  # 无答案篇章首位标记为-1
                 probas = probas[available_idxs]
                 inputs = [i for i in inputs if i[0, 0] > -1]  # 过滤掉无答案篇章
+                
         if self.mode == 'extractive':
             # 如果是抽取式，那么答案必须是篇章的一个片段
             # 那么将非篇章片段的概率值全部置0,然后在需要设置概率的地方设置概率值
@@ -208,7 +219,9 @@ class ReadingComprehension(AutoRegressiveDecoder):
                 p_token_ids = token_ids[1:sep_idx]
 
                 """
-                这里是设置ngram，比如一句话:我爱我家，那么我后面会跟"爱"或者"家",那么这个时候就会设置key: ("我"的token_id) , value是{ "爱"的token_id,"家"的token_id }
+                因为抽取的时候，很有可能出现同个单词出现在不同的地方，这个时候需要判断到底是哪个地方。
+                这里是设置ngram，比如一句话:我爱我家，那么我后面会跟"爱"或者"家",
+                那么这个时候就会设置key: ("我"的token_id) , value是{ "爱"的token_id,"家"的token_id }
                 """
                 for k, v in self.get_ngram_set(p_token_ids, states + 1).items():
                     ngrams[k] = ngrams.get(k, set()) | v
@@ -221,7 +234,9 @@ class ReadingComprehension(AutoRegressiveDecoder):
                 available_idxs.add(tokenizer._token_end_id)
                 available_idxs = list(available_idxs)
                 new_probas[:, i, available_idxs] = probas[:, i, available_idxs]
+
             probas = new_probas
+
         return (probas**2).sum(0) / (probas.sum(0) + 1), states + 1  # 某种平均投票方式
 
     def answer(self, question, passages, topk=1):

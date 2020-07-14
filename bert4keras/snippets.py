@@ -386,7 +386,7 @@ class AutoRegressiveDecoder(object):
         """
         raise NotImplementedError
 
-    
+
     def beam_search(self, inputs, topk, states=None, min_ends=1):
         """beam search解码
         说明：这里的topk即beam size；
@@ -395,9 +395,12 @@ class AutoRegressiveDecoder(object):
         inputs = [np.array([i]) for i in inputs]
         output_ids, output_scores = self.first_output_ids, np.zeros(1)
         for step in range(self.maxlen):
+
+            # 迭代计算每一步的得分
             scores, states = self.predict(
                 inputs, output_ids, states, 'logits'
-            )  # 计算当前得分
+            )
+
             if step == 0:  # 第1步预测后将输入重复topk次
                 inputs = [np.repeat(i, topk, axis=0) for i in inputs]
             scores = output_scores.reshape((-1, 1)) + scores  # 综合累积得分
