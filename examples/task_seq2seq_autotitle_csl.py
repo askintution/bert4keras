@@ -30,6 +30,9 @@ dict_path = '/root/kg/bert/chinese_wwm_L-12_H-768_A-12/vocab.txt'
 
 
 def load_data(filename):
+    """加载数据
+    单条格式：(标题, 正文)
+    """
     D = []
     with open(filename, encoding='utf-8') as f:
         for l in f:
@@ -118,7 +121,9 @@ class AutoTitle(AutoRegressiveDecoder):
 autotitle = AutoTitle(start_id=None, end_id=tokenizer._token_end_id, maxlen=32)
 
 
-class Evaluate(keras.callbacks.Callback):
+class Evaluator(keras.callbacks.Callback):
+    """评估与保存
+    """
     def __init__(self):
         self.rouge = Rouge()
         self.smooth = SmoothingFunction().method1
@@ -137,8 +142,8 @@ class Evaluate(keras.callbacks.Callback):
         rouge_1, rouge_2, rouge_l, bleu = 0, 0, 0, 0
         for title, content in tqdm(data):
             total += 1
-            title = ' '.join(title)
-            pred_title = ' '.join(autotitle.generate(content, topk))
+            title = ' '.join(title).lower()
+            pred_title = ' '.join(autotitle.generate(content, topk)).lower()
             if pred_title.strip():
                 scores = self.rouge.get_scores(hyps=pred_title, refs=title)
                 rouge_1 += scores[0]['rouge-1']['f']
@@ -163,7 +168,7 @@ class Evaluate(keras.callbacks.Callback):
 
 if __name__ == '__main__':
 
-    evaluator = Evaluate()
+    evaluator = Evaluator()
     train_generator = data_generator(train_data, batch_size)
 
     model.fit_generator(
