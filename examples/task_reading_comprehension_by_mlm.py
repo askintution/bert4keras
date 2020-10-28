@@ -156,6 +156,7 @@ def gen_answer(question, passages):
     for t, p in zip(all_p_token_ids, probas):
         a, score = tuple(), 0.
         for i in range(max_a_len):
+            # 每次都去取一定长度的字段，如果这个字段中没有end标记，那么就在结尾加上end标记
             idxs = list(get_ngram_set(t, i + 1)[a])
             if tokenizer._token_end_id not in idxs:
                 idxs.append(tokenizer._token_end_id)
@@ -166,6 +167,8 @@ def gen_answer(question, passages):
             score += pi.max()
             if a[-1] == tokenizer._token_end_id:
                 break
+
+        # 因为score的计算跟句子的长度有关系，这里做平均
         score = score / (i + 1)
         a = tokenizer.decode(a)
         if a:
