@@ -1,9 +1,10 @@
 #! -*- coding: utf-8 -*-
-# 工具函数
+# 分词函数
 
 import unicodedata, re
 from bert4keras.snippets import is_string, is_py2
 from bert4keras.snippets import open
+from bert4keras.snippets import convert_to_unicode
 
 
 def load_vocab(dict_path, encoding='utf-8', simplified=False, startswith=None):
@@ -51,22 +52,42 @@ def save_vocab(dict_path, token_dict, encoding='utf-8'):
             writer.write(k + '\n')
 
 
-class BasicTokenizer(object):
+class TokenizerBase(object):
     """分词器基类
     """
-    def __init__(self, token_start='[CLS]', token_end='[SEP]'):
-        """初始化
+    def __init__(
+        self,
+        token_start='[CLS]',
+        token_end='[SEP]',
+        pre_tokenize=None,
+        token_translate=None
+    ):
+        """参数说明：
+        pre_tokenize：外部传入的分词函数，用作对文本进行预分词。如果传入
+                      pre_tokenize，则先执行pre_tokenize(text)，然后在它
+                      的基础上执行原本的tokenize函数；
+        token_translate：映射字典，主要用在tokenize之后，将某些特殊的token
+                         替换为对应的token。
         """
         self._token_pad = '[PAD]'
         self._token_unk = '[UNK]'
         self._token_mask = '[MASK]'
         self._token_start = token_start
         self._token_end = token_end
+        self._pre_tokenize = pre_tokenize
+        self._token_translate = token_translate or {}
+        self._token_translate_inv = {
+            v: k
+            for k, v in self._token_translate.items()
+        }
 
     def tokenize(self, text, maxlen=None):
         """分词函数
         """
-        tokens = self._tokenize(text)
+        tokens = [
+            self._token_translate.get(token) or token
+            for token in self._tokenize(text)
+        ]
         if self._token_start is not None:
             tokens.insert(0, self._token_start)
         if self._token_end is not None:
@@ -161,23 +182,16 @@ class BasicTokenizer(object):
         raise NotImplementedError
 
 
-class Tokenizer(BasicTokenizer):
+class Tokenizer(TokenizerBase):
     """Bert原生分词器
     纯Python实现，代码修改自keras_bert的tokenizer实现
     """
-    def __init__(
-        self, token_dict, do_lower_case=False, pre_tokenize=None, **kwargs
-    ):
-        """这里的pre_tokenize是外部传入的分词函数，用作对文本进行预分词。如果传入
-        pre_tokenize，则先执行pre_tokenize(text)，然后在它的基础上执行原本的
-        tokenize函数。
-        """
+    def __init__(self, token_dict, do_lower_case=False, **kwargs):
         super(Tokenizer, self).__init__(**kwargs)
         if is_string(token_dict):
             token_dict = load_vocab(token_dict)
 
         self._do_lower_case = do_lower_case
-        self._pre_tokenize = pre_tokenize
         self._token_dict = token_dict
         self._token_dict_inv = {v: k for k, v in token_dict.items()}
         self._vocab_size = len(token_dict)
@@ -388,7 +402,7 @@ class Tokenizer(BasicTokenizer):
         return token_mapping
 
 
-class SpTokenizer(BasicTokenizer):
+class SpTokenizer(TokenizerBase):
     """基于SentencePiece模型的封装，使用上跟Tokenizer基本一致。
     """
     def __init__(self, sp_model_path, **kwargs):
@@ -424,13 +438,19 @@ class SpTokenizer(BasicTokenizer):
     def decode(self, ids):
         """转为可读文本
         """
-        ids = [i for i in ids if self._is_decodable(i)]
-        text = self.sp_model.decode_ids(ids)
-        return text.decode('utf-8') if is_py2 else text
+        tokens = [
+            self._token_translate_inv.get(token) or token
+            for token in self.ids_to_tokens(ids)
+        ]
+        text = self.sp_model.decode_pieces(tokens)
+        return convert_to_unicode(text)
 
     def _tokenize(self, text):
         """基本分词函数
         """
+        if self._pre_tokenize is not None:
+            text = ' '.join(self._pre_tokenize(text))
+
         tokens = self.sp_model.encode_as_pieces(text)
         return tokens
 

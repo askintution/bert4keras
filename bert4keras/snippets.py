@@ -91,12 +91,21 @@ class open:
             self.file = _open_(name, mode, encoding=encoding, errors=errors)
         self.encoding = encoding
         self.errors = errors
+        self.iterator = None
 
     def __iter__(self):
         for l in self.file:
             if self.encoding:
                 l = convert_to_unicode(l, self.encoding, self.errors)
             yield l
+
+    def next(self):
+        if self.iterator is None:
+            self.iterator = self.__iter__()
+        return next(self.iterator)
+
+    def __next__(self):
+        return self.next()
 
     def read(self):
         text = self.file.read()
@@ -123,24 +132,40 @@ class open:
 
 
 def parallel_apply(
-    func, iterable, workers, max_queue_size, callback=None, dummy=False
+    func,
+    iterable,
+    workers,
+    max_queue_size,
+    callback=None,
+    dummy=False,
+    random_seeds=True
 ):
     """多进程或多线程地将func应用到iterable的每个元素中。
     注意这个apply是异步且无序的，也就是说依次输入a,b,c，但是
     输出可能是func(c), func(a), func(b)。
     参数：
+        callback: 处理单个输出的回调函数；
         dummy: False是多进程/线性，True则是多线程/线性；
-        callback: 处理单个输出的回调函数。
+        random_seeds: 每个进程的随机种子。
     """
     if dummy:
         from multiprocessing.dummy import Pool, Queue
     else:
         from multiprocessing import Pool, Queue
 
-    in_queue, out_queue = Queue(max_queue_size), Queue()
+    in_queue, out_queue, seed_queue = Queue(max_queue_size), Queue(), Queue()
+    if random_seeds is True:
+        random_seeds = np.random.randint(0, 2**32, workers)
+    elif random_seeds is None or random_seeds is False:
+        random_seeds = []
+    for seed in random_seeds:
+        seed_queue.put(seed)
 
     def worker_step(in_queue, out_queue):
-        # 单步函数包装成循环执行
+        """单步函数包装成循环执行
+        """
+        if not seed_queue.empty():
+            np.random.seed(seed_queue.get())
         while True:
             i, d = in_queue.get()
             r = func(d)
@@ -294,9 +319,9 @@ class DataGenerator(object):
     def __iter__(self, random=False):
         raise NotImplementedError
 
-    def forfit(self):
+    def forfit(self, random=True):
         while True:
-            for d in self.__iter__(True):
+            for d in self.__iter__(random):
                 yield d
 
 
@@ -364,11 +389,17 @@ class AutoRegressiveDecoder(object):
     def wraps(default_rtype='probas', use_states=False):
         """用来进一步完善predict函数
         目前包含：1. 设置rtype参数，并做相应处理；
-                  2. 确定states的使用，并做相应处理。
+                  2. 确定states的使用，并做相应处理；
+                  3. 设置温度参数，并做相应处理。
         """
         def actual_decorator(predict):
             def new_predict(
-                self, inputs, output_ids, states, rtype=default_rtype
+                self,
+                inputs,
+                output_ids,
+                states,
+                temperature=1,
+                rtype=default_rtype
             ):
                 assert rtype in ['probas', 'logits']
                 prediction = predict(self, inputs, output_ids, states)
@@ -377,7 +408,13 @@ class AutoRegressiveDecoder(object):
                     prediction = (prediction, None)
 
                 if default_rtype == 'logits':
-                    prediction = (softmax(prediction[0]), prediction[1])
+                    prediction = (
+                        softmax(prediction[0] / temperature), prediction[1]
+                    )
+                elif temperature != 1:
+                    probas = np.power(prediction[0], 1.0 / temperature)
+                    probas = probas / probas.sum(axis=-1, keepdims=True)
+                    prediction = (probas, prediction[1])
 
                 if rtype == 'probas':
                     return prediction
@@ -388,17 +425,17 @@ class AutoRegressiveDecoder(object):
 
         return actual_decorator
 
-    def predict(self, inputs, output_ids, states=None, rtype='logits'):
+    def predict(self, inputs, output_ids, states=None):
         """用户需自定义递归预测函数
-        说明：rtype为字符串logits或probas，用户定义的时候，应当根据rtype来
-              返回不同的结果，rtype=probas时返回归一化的概率，rtype=logits时
-              则返回softmax前的结果或者概率对数。
+        说明：定义的时候，需要用wraps方法进行装饰，传入default_rtype和use_states，
+             其中default_rtype为字符串logits或probas，probas时返回归一化的概率，
+             rtype=logits时则返回softmax前的结果或者概率对数。
         返回：二元组 (得分或概率, states)
         """
         raise NotImplementedError
 
 
-    def beam_search(self, inputs, topk, states=None, min_ends=1):
+    def beam_search(self, inputs, topk, states=None, temperature=1, min_ends=1):
         """beam search解码
         说明：这里的topk即beam size；
         返回：最优解码序列。
@@ -409,9 +446,8 @@ class AutoRegressiveDecoder(object):
 
             # 迭代计算每一步的得分
             scores, states = self.predict(
-                inputs, output_ids, states, 'logits'
-            )
-
+                inputs, output_ids, states, temperature, 'logits'
+            )  # 计算当前得分
             if step == 0:  # 第1步预测后将输入重复topk次
                 inputs = [np.repeat(i, topk, axis=0) for i in inputs]
             scores = output_scores.reshape((-1, 1)) + scores  # 综合累积得分
@@ -451,7 +487,14 @@ class AutoRegressiveDecoder(object):
     而这里挑选的策略，目前最主流的便是，TopK 和 TopP.
     """
     def random_sample(
-        self, inputs, n, topk=None, topp=None, states=None, min_ends=1
+        self,
+        inputs,
+        n,
+        topk=None,
+        topp=None,
+        states=None,
+        temperature=1,
+        min_ends=1
     ):
         """随机采样n个结果
         说明：非None的topk表示每一步只从概率最高的topk个中采样；而非None的topp
@@ -463,7 +506,7 @@ class AutoRegressiveDecoder(object):
         results = []
         for step in range(self.maxlen):
             probas, states = self.predict(
-                inputs, output_ids, states, 'probas'
+                inputs, output_ids, states, temperature, 'probas'
             )  # 计算当前概率
             probas /= probas.sum(axis=1, keepdims=True)  # 确保归一化
             if step == 0:  # 第1步预测后将结果重复n次
@@ -663,18 +706,16 @@ class WebServing(object):
             kwargs = {}
             for key, value in arguments.items():
                 if method == 'GET':
-                    result = self.bottle.request.GET.get(key)
+                    result = self.bottle.request.GET.getunicode(key)
                 else:
-                    result = self.bottle.request.POST.get(key)
+                    result = self.bottle.request.POST.getunicode(key)
                 if result is None:
                     if value[1]:
                         outputs['code'] = 1
                         outputs['desc'] = 'lack of "%s" argument' % key
                         return json.dumps(outputs, ensure_ascii=False)
                 else:
-                    if value[0] is None:
-                        result = convert_to_unicode(result)
-                    else:
+                    if value[0] is not None:
                         result = value[0](result)
                     kwargs[key] = result
             try:

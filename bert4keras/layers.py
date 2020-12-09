@@ -128,6 +128,33 @@ class BiasAdd(Layer):
         return K.bias_add(inputs, self.bias)
 
 
+class Concatenate1D(Layer):
+    """1维序列拼接层
+    说明：本来该功能可以直接通过Concatenate层来实现，无奈Keras
+          自带的Concatenate层的compute_mask写得不合理，导致一个
+          带mask的序列与一个不带mask的序列拼接会报错，因此干脆
+          自己重写一个好了。
+    """
+    def call(self, inputs):
+        return K.concatenate(inputs, axis=1)
+
+    def compute_mask(self, inputs, mask=None):
+        if mask is not None:
+            masks = []
+            for i, m in enumerate(mask):
+                if m is None:
+                    m = K.ones_like(inputs[i][..., 0], dtype='bool')
+                masks.append(m)
+            return K.concatenate(masks, axis=1)
+
+    def compute_output_shape(self, input_shape):
+        if all([shape[1] for shape in input_shape]):
+            seq_len = sum([shape[1] for shape in input_shape])
+            return (input_shape[0][0], seq_len, input_shape[0][2])
+        else:
+            return (input_shape[0][0], None, input_shape[0][2])
+
+
 class MultiHeadAttention(Layer):
     """
     多头注意力机制
@@ -176,7 +203,7 @@ class MultiHeadAttention(Layer):
         )
 
     @recompute_grad
-    def call(self, inputs, mask=None, a_mask=None, p_bias=None):
+    def call(self, inputs, mask=None, **kwargs):
         """实现多头注意力
         q_mask: 对输入的query序列的mask。
                 主要是将输出结果的padding部分置0。
@@ -198,17 +225,15 @@ class MultiHeadAttention(Layer):
         8. 位置编码
         9. output dense
         10. 对output进行query的mask处理
+
         """
         q, k, v = inputs[:3]
-        q_mask, v_mask, n = None, None, 3
+        q_mask, v_mask = None, None
         if mask is not None:
             if mask[0] is not None:
                 q_mask = K.cast(mask[0], K.floatx())
             if mask[2] is not None:
                 v_mask = K.cast(mask[2], K.floatx())
-        if a_mask:
-            a_mask = inputs[n]
-            n += 1
         # 线性变换
         qw = self.q_dense(q)
         kw = self.k_dense(k)
@@ -217,6 +242,33 @@ class MultiHeadAttention(Layer):
         qw = K.reshape(qw, (-1, K.shape(q)[1], self.heads, self.key_size))
         kw = K.reshape(kw, (-1, K.shape(k)[1], self.heads, self.key_size))
         vw = K.reshape(vw, (-1, K.shape(v)[1], self.heads, self.head_size))
+        # Attention
+        qkv_inputs = [qw, kw, vw] + inputs[3:]
+        qv_masks = [q_mask, v_mask]
+        o = self.pay_attention_to(qkv_inputs, qv_masks, **kwargs)
+        # 完成输出
+        o = K.reshape(o, (-1, K.shape(o)[1], self.head_size * self.heads))
+        o = self.o_dense(o)
+        # 返回结果
+        o = sequence_masking(o, q_mask, 0)
+        return o
+
+    def pay_attention_to(self, inputs, mask=None, **kwargs):
+        """实现标准的乘性多头注意力
+        a_mask: 对attention矩阵的mask。
+                不同的attention mask对应不同的应用。
+        p_bias: 在attention里的位置偏置。
+                一般用来指定相对位置编码的种类。
+        说明: 这里单独分离出pay_attention_to函数，是为了方便
+              继承此类来定义不同形式的atttention；此处要求
+              返回o.shape=(batch_size, seq_len, heads, head_size)。
+        """
+        (qw, kw, vw), n = inputs[:3], 3
+        q_mask, v_mask = mask
+        a_mask, p_bias = kwargs.get('a_mask'), kwargs.get('p_bias')
+        if a_mask:
+            a_mask = inputs[n]
+            n += 1
         # Attention
         a = tf.einsum('bjhd,bkhd->bhjk', qw, kw)
         # 处理位置编码
@@ -239,10 +291,6 @@ class MultiHeadAttention(Layer):
         # 如果是相对位置编码，还要加上attention 矩阵乘法 pos_embeddings
         if p_bias == 'typical_relative':
             o = o + tf.einsum('bhjk,jkd->bjhd', a, pos_embeddings)
-        o = K.reshape(o, (-1, K.shape(o)[1], self.head_size * self.heads))
-        o = self.o_dense(o)
-        # 返回结果
-        o = sequence_masking(o, q_mask, 0)
         return o
 
     def compute_output_shape(self, input_shape):
@@ -293,7 +341,8 @@ class LayerNormalization(Layer):
 
     def compute_mask(self, inputs, mask=None):
         if self.conditional:
-            masks = [K.expand_dims(m, 0) for m in mask if m is not None]
+            masks = mask if mask is not None else []
+            masks = [m[None] for m in masks if m is not None]
             if len(masks) == 0:
                 return None
             else:
@@ -398,13 +447,14 @@ class LayerNormalization(Layer):
 
 
 class PositionEmbedding(Layer):
-    """定义位置Embedding，这里的Embedding是可训练的。
+    """定义可训练的位置Embedding
     """
     def __init__(
         self,
         input_dim,
         output_dim,
         merge_mode='add',
+        hierarchical=None,
         embeddings_initializer='zeros',
         custom_position_ids=False,
         **kwargs
@@ -413,6 +463,7 @@ class PositionEmbedding(Layer):
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.merge_mode = merge_mode
+        self.hierarchical = hierarchical
         self.embeddings_initializer = initializers.get(embeddings_initializer)
         self.custom_position_ids = custom_position_ids
 
@@ -434,32 +485,37 @@ class PositionEmbedding(Layer):
     def call(self, inputs):
         """如果custom_position_ids，那么第二个输入为自定义的位置id
         """
+        input_shape = K.shape(inputs)
+        batch_size, seq_len = input_shape[0], input_shape[1]
+
         if self.custom_position_ids:
             inputs, position_ids = inputs
             if K.dtype(position_ids) != 'int32':
                 position_ids = K.cast(position_ids, 'int32')
-            pos_embeddings = K.gather(self.embeddings, position_ids)
         else:
-            input_shape = K.shape(inputs)
-            batch_size, seq_len = input_shape[0], input_shape[1]
-            pos_embeddings = self.embeddings[:seq_len]
-            pos_embeddings = K.expand_dims(pos_embeddings, 0)
 
-            """
-            embeddings不是直接相加，需要expand维度。
-            keras.backend.tile(x, n)： 创建一个用 n 平铺 的 x 张量。
+            position_ids = K.arange(0, seq_len, dtype='int32')[None]
 
-            example:
-            K.tile(inputs,[1,1,1,512]) 
-            #inputs是四维张量，[batchsize,width,height, channels]
-            #把channel第四维复制512倍  经常搭配Kexpand_dims(x, axis=-1)
-            """
-            if self.merge_mode != 'add':
-                pos_embeddings = K.tile(pos_embeddings, [batch_size, 1, 1])
+        if self.hierarchical:
+            alpha = 0.4 if self.hierarchical is True else self.hierarchical
+            embeddings = self.embeddings - alpha * self.embeddings[:1]
+            embeddings = embeddings / (1 - alpha)
+            embeddings_x = K.gather(embeddings, position_ids // self.input_dim)
+            embeddings_y = K.gather(embeddings, position_ids % self.input_dim)
+            pos_embeddings = alpha * embeddings_x + (1 - alpha) * embeddings_y
+        else:
+            if self.custom_position_ids:
+                pos_embeddings = K.gather(self.embeddings, position_ids)
+            else:
+                pos_embeddings = self.embeddings[None, :seq_len]
 
         if self.merge_mode == 'add':
             return inputs + pos_embeddings
+        elif self.merge_mode == 'mul':
+            return inputs * pos_embeddings
         else:
+            if not self.custom_position_ids:
+                pos_embeddings = K.tile(pos_embeddings, [batch_size, 1, 1])
             return K.concatenate([inputs, pos_embeddings])
 
     """
@@ -469,7 +525,7 @@ class PositionEmbedding(Layer):
         if self.custom_position_ids:
             input_shape = input_shape[0]
 
-        if self.merge_mode == 'add':
+        if self.merge_mode in ['add', 'mul']:
             return input_shape
         else:
             return input_shape[:2] + (input_shape[2] + self.output_dim,)
@@ -483,11 +539,73 @@ class PositionEmbedding(Layer):
             'input_dim': self.input_dim,
             'output_dim': self.output_dim,
             'merge_mode': self.merge_mode,
+            'hierarchical': self.hierarchical,
             'embeddings_initializer':
                 initializers.serialize(self.embeddings_initializer),
             'custom_position_ids': self.custom_position_ids,
         }
         base_config = super(PositionEmbedding, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+
+class SinusoidalPositionEmbedding(Layer):
+    """定义Sin-Cos位置Embedding
+    """
+    def __init__(
+        self, output_dim, merge_mode='add', custom_position_ids=False, **kwargs
+    ):
+        super(SinusoidalPositionEmbedding, self).__init__(**kwargs)
+        self.output_dim = output_dim
+        self.merge_mode = merge_mode
+        self.custom_position_ids = custom_position_ids
+
+    def call(self, inputs):
+        """如果custom_position_ids，那么第二个输入为自定义的位置id
+        """
+        input_shape = K.shape(inputs)
+        batch_size, seq_len = input_shape[0], input_shape[1]
+
+        if self.custom_position_ids:
+            inputs, position_ids = inputs
+        else:
+            position_ids = K.arange(0, seq_len, dtype=K.floatx())[None]
+
+        indices = K.arange(0, self.output_dim // 2, dtype=K.floatx())
+        indices = K.pow(10000.0, -2 * indices / self.output_dim)
+        pos_embeddings = tf.einsum('bn,d->bnd', position_ids, indices)
+        pos_embeddings = K.concatenate([
+            K.sin(pos_embeddings)[..., None],
+            K.cos(pos_embeddings)[..., None]
+        ])
+        pos_embeddings = K.reshape(
+            pos_embeddings, (-1, seq_len, self.output_dim)
+        )
+
+        if self.merge_mode == 'add':
+            return inputs + pos_embeddings
+        elif self.merge_mode == 'mul':
+            return inputs * pos_embeddings
+        else:
+            if not self.custom_position_ids:
+                pos_embeddings = K.tile(pos_embeddings, [batch_size, 1, 1])
+            return K.concatenate([inputs, pos_embeddings])
+
+    def compute_output_shape(self, input_shape):
+        if self.custom_position_ids:
+            input_shape = input_shape[0]
+
+        if self.merge_mode in ['add', 'mul']:
+            return input_shape
+        else:
+            return input_shape[:2] + (input_shape[2] + self.output_dim,)
+
+    def get_config(self):
+        config = {
+            'output_dim': self.output_dim,
+            'merge_mode': self.merge_mode,
+            'custom_position_ids': self.custom_position_ids,
+        }
+        base_config = super(SinusoidalPositionEmbedding, self).get_config()
         return dict(list(base_config.items()) + list(config.items()))
 
 
@@ -663,7 +781,9 @@ class FeedForward(Layer):
     def get_config(self):
         config = {
             'units': self.units,
-            'activation': activations.serialize(self.activation),
+            'activation': [
+                activations.serialize(act) for act in self.activation
+            ],
             'use_bias': self.use_bias,
             'kernel_initializer':
                 initializers.serialize(self.kernel_initializer),
@@ -1014,6 +1134,15 @@ class Loss(Layer):
         else:
             return input_shape[self.output_axis]
 
+    def compute_mask(self, inputs, mask):
+        if mask is not None:
+            if self.output_axis is None:
+                return mask
+            elif isinstance(self.output_axis, list):
+                return [mask[i] for i in self.output_axis]
+            else:
+                return mask[self.output_axis]
+
     def get_config(self):
         config = {
             'output_axis': self.output_axis,
@@ -1025,9 +1154,11 @@ class Loss(Layer):
 custom_objects = {
     'Embedding': Embedding,
     'BiasAdd': BiasAdd,
+    'Concatenate1D': Concatenate1D,
     'MultiHeadAttention': MultiHeadAttention,
     'LayerNormalization': LayerNormalization,
     'PositionEmbedding': PositionEmbedding,
+    'SinusoidalPositionEmbedding': SinusoidalPositionEmbedding,
     'RelativePositionEmbedding': RelativePositionEmbedding,
     'RelativePositionEmbeddingT5': RelativePositionEmbeddingT5,
     'FeedForward': FeedForward,

@@ -251,7 +251,7 @@ class ReadingComprehension(AutoRegressiveDecoder):
         从passage和query的词汇中beam search
         """
         output_ids = self.beam_search(
-            token_ids, topk, states=0
+            token_ids, topk=topk, states=0
         )  # 基于beam search
         return tokenizer.decode(output_ids)
 
@@ -298,7 +298,7 @@ if __name__ == '__main__':
     evaluator = Evaluator()
     train_generator = data_generator(train_data, batch_size)
 
-    model.fit_generator(
+    model.fit(
         train_generator.forfit(),
         steps_per_epoch=len(train_generator),
         epochs=epochs,

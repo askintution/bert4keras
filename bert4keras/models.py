@@ -66,6 +66,7 @@ class Transformer(object):
     """
     def build(
         self,
+        attention_caches=None,
         layer_norm_cond=None,
         layer_norm_cond_hidden_size=None,
         layer_norm_cond_hidden_act=None,
@@ -73,8 +74,10 @@ class Transformer(object):
         **kwargs
     ):
         """模型构建函数
-        layer_norm_*系列参数为实现Conditional Layer Normalization时使用，
-        用来实现以“固定长度向量”为条件的条件Bert。
+        attention_caches：为Attention的K,V的缓存序列字典，格式为
+                         {Attention层名: [K缓存, V缓存]}；
+        layer_norm_*系列参数：实现Conditional Layer Normalization时使用，
+                            用来实现以“固定长度向量”为条件的条件Bert。
         """
         if self.built:
             return None
@@ -82,6 +85,10 @@ class Transformer(object):
         inputs = self.get_inputs()
         self.set_inputs(inputs, additional_input_layers)
         
+   
+        # Other
+        self.attention_caches = attention_caches or {}
+
         """
         layer_norm_cond: 是个shape参数
         layer_norm_cond_hidden_size:如果该参数为None，则意味着它是一个整数，用于先将输入条件投影到更低维空间，这是因为输入的条件可能维度很高，直接投影到hidden_size（比如768）的话，
@@ -149,6 +156,13 @@ class Transformer(object):
         if inputs is None:
             return self.layers[name]
         else:
+            if isinstance(self.layers[name], MultiHeadAttention):
+                if name in self.attention_caches:
+                    k_cache, v_cache = self.attention_caches[name]
+                    k_name, v_name = name + '-Cached-Key', name + '-Cached-Value'
+                    k = Concatenate1D(name=k_name)([k_cache, inputs[1]])
+                    v = Concatenate1D(name=v_name)([v_cache, inputs[2]])
+                    inputs = inputs[:1] + [k, v] + inputs[3:]
             return self.layers[name](inputs, **arguments)
 
     def get_inputs(self):
@@ -238,7 +252,10 @@ class Transformer(object):
     def load_variable(self, checkpoint, name):
         """加载单个变量的函数
         """
-        return tf.train.load_variable(checkpoint, name)
+        if isinstance(checkpoint, dict):
+            return checkpoint[name]
+        else:
+            return tf.train.load_variable(checkpoint, name)
 
     def create_variable(self, name, value):
         """创建一个变量
@@ -377,6 +394,7 @@ class BERT(Transformer):
         with_pool=False,  # 是否包含Pool部分
         with_nsp=False,  # 是否包含NSP部分
         with_mlm=False,  # 是否包含MLM部分
+        hierarchical_position=None,  # 是否层次分解位置编码
         custom_position_ids=False,  # 是否自行传入位置id
         shared_segment_embeddings=False,  # 若True，则segment跟token共用embedding
         **kwargs  # 其余参数
@@ -387,6 +405,7 @@ class BERT(Transformer):
         self.with_pool = with_pool
         self.with_nsp = with_nsp
         self.with_mlm = with_mlm
+        self.hierarchical_position = hierarchical_position
         self.custom_position_ids = custom_position_ids
         self.shared_segment_embeddings = shared_segment_embeddings
         # 默认，下一句预测是使用pool方法的
@@ -480,6 +499,7 @@ class BERT(Transformer):
             input_dim=self.max_position,
             output_dim=self.embedding_size,
             merge_mode='add',
+            hierarchical=self.hierarchical_position,
             embeddings_initializer=self.initializer,
             custom_position_ids=self.custom_position_ids,
             name='Embedding-Position'
@@ -1166,14 +1186,14 @@ class ELECTRA(BERT):
         return mapping
 
 
-class GPT_OpenAI(LM_Mask, BERT):
+class GPT(LM_Mask, BERT):
     """构建GPT模型
     链接：https://github.com/openai/finetune-transformer-lm
     """
     @insert_arguments(final_activation='softmax')
     @delete_arguments('with_pool', 'with_mlm')
     def __init__(self, **kwargs):
-        super(GPT_OpenAI, self).__init__(**kwargs)
+        super(GPT, self).__init__(**kwargs)
 
     def apply_embeddings(self, inputs):
         """GPT的embedding是token、position、segment三者embedding之和
@@ -1219,6 +1239,7 @@ class GPT_OpenAI(LM_Mask, BERT):
             input_dim=self.max_position,
             output_dim=self.embedding_size,
             merge_mode='add',
+            hierarchical=self.hierarchical_position,
             embeddings_initializer=self.initializer,
             custom_position_ids=self.custom_position_ids,
             name='Embedding-Position'
@@ -1261,10 +1282,19 @@ class GPT_OpenAI(LM_Mask, BERT):
 
         return x
 
+    def load_variable(self, checkpoint, name):
+        """加载单个变量的函数
+        """
+        variable = super(GPT, self).load_variable(checkpoint, name)
+        if name == 'gpt/embeddings/word_embeddings':
+            return self.load_embeddings(variable)
+        else:
+            return variable
+
     def variable_mapping(self):
         """映射到TF版GPT权重格式
         """
-        mapping = super(GPT_OpenAI, self).variable_mapping()
+        mapping = super(GPT, self).variable_mapping()
         mapping = {
             k: [
                 i.replace('bert/', 'gpt/').replace('encoder', 'transformer')
@@ -1275,20 +1305,176 @@ class GPT_OpenAI(LM_Mask, BERT):
         return mapping
 
 
-class GPT2_ML(LM_Mask, Transformer):
+class GPT2(GPT):
+    """构建GPT2模型
+    链接: https://github.com/openai/gpt-2
+    """
+    def get_inputs(self):
+        """GPT2的输入是token_ids
+        """
+        x_in = self.apply(
+            layer=Input, shape=(self.sequence_length,), name='Input-Token'
+        )
+        return x_in
+
+    def apply_embeddings(self, inputs):
+        """GPT2的embedding是token、position两者embedding之和
+        """
+        x = inputs
+
+        x = self.apply(
+            inputs=x,
+            layer=Embedding,
+            input_dim=self.vocab_size,
+            output_dim=self.embedding_size,
+            embeddings_initializer=self.initializer,
+            mask_zero=True,
+            name='Embedding-Token'
+        )
+        x = self.apply(
+            inputs=x,
+            layer=PositionEmbedding,
+            input_dim=self.max_position,
+            output_dim=self.embedding_size,
+            merge_mode='add',
+            hierarchical=self.hierarchical_position,
+            embeddings_initializer=self.initializer,
+            name='Embedding-Position'
+        )
+        if self.embedding_size != self.hidden_size:
+            x = self.apply(
+                inputs=x,
+                layer=Dense,
+                units=self.hidden_size,
+                kernel_initializer=self.initializer,
+                name='Embedding-Mapping'
+            )
+
+        return x
+
+    def apply_main_layers(self, inputs, index):
+        """GPT2的主体是基于Self-Attention的模块
+        顺序：LN --> Att  --> Add --> LN --> FFN --> Add
+        """
+        x = inputs
+        z = self.layer_norm_conds[0]
+
+        attention_name = 'Transformer-%d-MultiHeadSelfAttention' % index
+        feed_forward_name = 'Transformer-%d-FeedForward' % index
+        attention_mask = self.compute_attention_mask(index)
+
+        # Self Attention
+        xi = x
+        x = self.apply(
+            inputs=self.simplify([x, z]),
+            layer=LayerNormalization,
+            epsilon=1e-5,
+            conditional=(z is not None),
+            hidden_units=self.layer_norm_conds[1],
+            hidden_activation=self.layer_norm_conds[2],
+            hidden_initializer=self.initializer,
+            name='%s-Norm' % attention_name
+        )
+        x = self.apply(
+            inputs=[x, x, x, attention_mask],
+            layer=MultiHeadAttention,
+            arguments={'a_mask': True},
+            heads=self.num_attention_heads,
+            head_size=self.attention_head_size,
+            out_dim=self.hidden_size,
+            key_size=self.attention_key_size,
+            kernel_initializer=self.initializer,
+            name=attention_name
+        )
+        x = self.apply(
+            inputs=x,
+            layer=Dropout,
+            rate=self.dropout_rate,
+            name='%s-Dropout' % attention_name
+        )
+        x = self.apply(
+            inputs=[xi, x], layer=Add, name='%s-Add' % attention_name
+        )
+
+        # Feed Forward
+        xi = x
+        x = self.apply(
+            inputs=self.simplify([x, z]),
+            layer=LayerNormalization,
+            epsilon=1e-5,
+            conditional=(z is not None),
+            hidden_units=self.layer_norm_conds[1],
+            hidden_activation=self.layer_norm_conds[2],
+            hidden_initializer=self.initializer,
+            name='%s-Norm' % feed_forward_name
+        )
+        x = self.apply(
+            inputs=x,
+            layer=FeedForward,
+            units=self.intermediate_size,
+            activation=self.hidden_act,
+            kernel_initializer=self.initializer,
+            name=feed_forward_name
+        )
+        x = self.apply(
+            inputs=x,
+            layer=Dropout,
+            rate=self.dropout_rate,
+            name='%s-Dropout' % feed_forward_name
+        )
+        x = self.apply(
+            inputs=[xi, x], layer=Add, name='%s-Add' % feed_forward_name
+        )
+        return x
+
+    def apply_final_layers(self, inputs):
+        """剩余部分
+        """
+        x = inputs
+        z = self.layer_norm_conds[0]
+
+        x = self.apply(
+            inputs=self.simplify([x, z]),
+            layer=LayerNormalization,
+            epsilon=1e-5,
+            conditional=(z is not None),
+            hidden_units=self.layer_norm_conds[1],
+            hidden_activation=self.layer_norm_conds[2],
+            hidden_initializer=self.initializer,
+            name='Output-Norm'
+        )
+        x = self.apply(
+            inputs=x,
+            layer=Dropout,
+            rate=self.dropout_rate,
+            name='Output-Dropout'
+        )
+        x = super(GPT2, self).apply_final_layers(x)
+
+        return x
+
+    def variable_mapping(self):
+        """映射到TF版GPT2权重格式
+        """
+        mapping = super(GPT2, self).variable_mapping()
+        mapping = {
+            k: [i.replace('output/LayerNorm', 'input/LayerNorm') for i in v]
+            for k, v in mapping.items()
+        }
+        mapping['Output-Norm'] = [
+            'gpt/output/LayerNorm/beta',
+            'gpt/output/LayerNorm/gamma',
+        ]
+
+        return mapping
+
+
+class GPT2_ML(GPT):
     """构建GPT2_ML模型
     链接: https://github.com/imcaspar/gpt2-ml
+    注意：GPT2_ML虽然号称GPT2，但是它的结构其实更接近GPT，它自称GPT2的
+         原因大概是因为它开源的版本参数量达到了GPT2的15亿参数。
     """
-    def __init__(
-        self,
-        max_position,  # 序列最大长度
-        final_activation='softmax',  # 预测分布的激活函数
-        **kwargs  # 其余参数
-    ):
-        super(GPT2_ML, self).__init__(**kwargs)
-        self.max_position = max_position
-        self.final_activation = final_activation
-
     def get_inputs(self):
         """GPT2_ML的输入是token_ids
         """
@@ -1321,6 +1507,7 @@ class GPT2_ML(LM_Mask, Transformer):
             input_dim=self.max_position,
             output_dim=self.embedding_size,
             merge_mode='add',
+            hierarchical=self.hierarchical_position,
             embeddings_initializer=self.initializer,
             name='Embedding-Position'
         )
@@ -1427,27 +1614,6 @@ class GPT2_ML(LM_Mask, Transformer):
 
         return x
 
-    def apply_final_layers(self, inputs):
-        """剩余部分
-        """
-        x = inputs
-
-        # Language Model部分
-        x = self.apply(
-            inputs=x,
-            layer=Embedding,
-            arguments={'mode': 'dense'},
-            name='Embedding-Token'
-        )
-        x = self.apply(
-            inputs=x,
-            layer=Activation,
-            activation=self.final_activation,
-            name='LM-Activation'
-        )
-
-        return x
-
     def load_variable(self, checkpoint, name):
         """加载单个变量的函数
         """
@@ -1520,6 +1686,8 @@ class T5_Base(Transformer):
         variable = super(T5_Base, self).load_variable(checkpoint, name)
         if name == 'shared/embedding':
             return self.load_embeddings(variable)
+        elif name == 'decoder/logits/kernel':
+            return self.load_embeddings(variable.T).T
         elif 'relative_attention_bias' in name:
             return variable.T
         else:
@@ -2166,7 +2334,8 @@ def build_transformer_model(
         'roberta': BERT,
         'nezha': NEZHA,
         'electra': ELECTRA,
-        'gpt_openai': GPT_OpenAI,
+        'gpt': GPT,
+        'gpt2': GPT2,
         'gpt2_ml': GPT2_ML,
         't5': T5,
         't5_encoder': T5_Encoder,
